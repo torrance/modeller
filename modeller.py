@@ -18,21 +18,21 @@ from modeller.predict import predict
 
 
 def main(args):
-    with open(args.model) as f:
-        models = np.array(skymodel.parse(f))
-
-    comps = np.array([comp for model in models for comp in model.components])
-    ras = np.array([comp.ra for comp in comps])
-    decs = np.array([comp.dec for comp in comps])
-
-    # Set beam for each component
-    mwabeam = MWABeam(args.metafits)
 
     if not args.nosimulate:
-        print("Simulating %d components" % len(comps))
-        addImagingColumns(args.mset)
         mset = table(args.mset, readonly=False)
         freqs = mset.SPECTRAL_WINDOW.getcell('CHAN_FREQ', 0)
+        midfreq = np.mean(freqs)
+
+        with open(args.model) as f:
+            models = np.array(skymodel.parse(f))
+
+        comps = np.array([comp for model in models for comp in model.components if comp.flux(midfreq) > args.fluxthreshold])
+        ras = np.array([comp.ra for comp in comps])
+        decs = np.array([comp.dec for comp in comps])
+
+        mwabeam = MWABeam(args.metafits)
+        print("Simulating %d components" % len(comps))
 
         # Reset data
         data = mset.getcol('DATA')
@@ -45,7 +45,7 @@ def main(args):
             fluxes[i] = comp.flux(freqs)
 
         # Batch sources
-        batch = 10000
+        batch = 100000
         for start in range(0, len(comps), batch):
             end = start + batch
             print("Processing sources %d - %d" % (start, start + len(fluxes[start:end])))
@@ -54,6 +54,7 @@ def main(args):
         mset.close()
 
     if args.uncalibrate or args.noise:
+        addImagingColumns(args.mset)
         mset = table(args.mset, readonly=False)
         data = mset.getcol('DATA')
 
@@ -103,6 +104,7 @@ if __name__ == '__main__':
     parser.add_argument('--metafits', required=True)
     parser.add_argument('--nosimulate', action='store_true')
     parser.add_argument('--uncalibrate', action='store_true')
+    parser.add_argument('--fluxthreshold', type=float, default=0)
     parser.add_argument('--noise', type=float, default=0)
     args = parser.parse_args()
     main(args)
