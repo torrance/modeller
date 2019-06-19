@@ -1,121 +1,109 @@
 #! /usr/bin/env python
 from __future__ import print_function, division
 
+import argparse
+import time as tm
+
 from astropy.coordinates import SkyCoord
 from astropy.time import Time
 import astropy.units as units
-from casacore.tables import addImagingColumns, taql
+from casacore.tables import addImagingColumns, table, taql
 import numpy as np
 
-from radical.coordinates import radec_to_lm
-from radical.measurementset import MeasurementSet
-from radical.mwabeam import MWABeam
-import radical.skymodel as skymodel
+from astrobits.coordinates import radec_to_lm
+from astrobits.mwabeam import MWABeam
+import astrobits.skymodel as skymodel
+
+from modeller.predict import predict
 
 
-mwabeam = MWABeam('modelled.metafits')
+def main(args):
+    with open(args.model) as f:
+        models = np.array(skymodel.parse(f))
 
-with open('model.txt') as f:
-    models = np.array(skymodel.parse(f))
+    comps = np.array([comp for model in models for comp in model.components])
+    ras = np.array([comp.ra for comp in comps])
+    decs = np.array([comp.dec for comp in comps])
 
-comps = np.array([comp for model in models for comp in model.components])
-ras = np.array([comp.ra for comp in comps])
-decs = np.array([comp.dec for comp in comps])
+    # Set beam for each component
+    mwabeam = MWABeam(args.metafits)
 
-print("Simulating %d components" % len(comps))
+    if not args.nosimulate:
+        print("Simulating %d components" % len(comps))
+        addImagingColumns(args.mset)
+        mset = table(args.mset, readonly=False)
+        freqs = mset.SPECTRAL_WINDOW.getcell('CHAN_FREQ', 0)
 
-# Set beam for each component
-for comp in comps:
-    comp.beam = mwabeam
-
-if True:
-    addImagingColumns('modelled.ms')
-
-    mset = MeasurementSet('modelled.ms', refant=8, datacolumn='DATA')
-    unique_times = sorted(set(mset.getcol('TIME')))
-
-    ls, ms = radec_to_lm(ras, decs, mset.ra0, mset.dec0)
-    ns = np.sqrt(1 - ls**2 - ms**2)
-
-    for k, unique_time in enumerate(unique_times):
-        print("Time interval: %d/%d" % (k+1, len(unique_times)))
-        _mset = mset.mset
-        tbl = taql("select UVW, DATA from $_mset where TIME = $unique_time and not FLAG_ROW and ANTENNA1 <> ANTENNA2")
-        uvw, data = tbl.getcol('UVW'), tbl.getcol('DATA')
-
-        u_lambda, v_lambda, w_lambda = uvw.T[:, :, None] / mset.lambdas
+        # Reset data
+        data = mset.getcol('DATA')
         data[:] = 0
+        mset.putcol('DATA', data)
 
-        julian_date = unique_time // (24*60*60) + (unique_time % (24*60*60) / (24*60*60))
-        julian_date = Time(julian_date, format='mjd')
-        mwabeam.time = julian_date
+        # Calculate fluxes for each source for each frequency
+        fluxes = np.empty((len(comps), len(freqs)))
+        for i, comp in enumerate(comps):
+            fluxes[i] = comp.flux(freqs)
 
-        for j, freq in enumerate(mset.freqs):
-            fluxes = np.array([comp.flux(freq) for comp in comps])
+        # Batch sources
+        batch = 10000
+        for start in range(0, len(comps), batch):
+            end = start + batch
+            print("Processing sources %d - %d" % (start, start + len(fluxes[start:end])))
+            predict(mset, mwabeam, ras[start:end], decs[start:end], fluxes[start:end])
 
-            I = np.zeros((len(comps), 2, 2))  # [XX, XY, YX, YY]
-            I[:, 0, 0] = fluxes  # XX
-            I[:, 1, 1] = fluxes  # YY
+        mset.close()
 
-            jones = mwabeam.jones(ras, decs, freq)
-            jones_H = np.conj(np.transpose(jones, axes=[0, 2, 1]))
-            I_app = np.matmul(jones, np.matmul(I, jones_H))
-            I_app = np.reshape(I_app, (len(comps), 4))
+    if args.uncalibrate or args.noise:
+        mset = table(args.mset, readonly=False)
+        data = mset.getcol('DATA')
 
-            if j ==0:
-                idx = np.argmax(I_app[:, 0])
-                print(I_app[idx])
+        if args.uncalibrate:
+            ant1, ant2 = mset.getcol('ANTENNA1'), mset.getcol('ANTENNA2')
+            antids = range(0, mset.ANTENNAS)
 
-            points = np.exp(2j * np.pi * (u_lambda[:, j][None, :] * ls[:, None] + v_lambda[:, j][None, :] * ms[:, None] + w_lambda[:, j][None, :] * (ns[:, None] - 1)))
-            # point = [ comps, uvw ]
+            # Leakage
+            leakage =  np.random.uniform(-np.pi, np.pi, len(antids))
 
-            data[:, j, :] = np.sum(I_app[:, None, :] * points[:, :, None], axis=0)
+            # Gains
+            gX = np.random.uniform(0.1, 3, len(antids)) * np.exp(1j * np.random.uniform(-np.pi, np.pi, len(antids)))
+            gY = np.random.uniform(0.1, 3, len(antids)) * np.exp(1j * np.random.uniform(-np.pi, np.pi, len(antids)))
 
-        tbl.putcol('DATA', data)
+            # Uncalibration array
+            uncalibrators = np.zeros((len(antids), 2, 2), dtype=np.complex)
+            uncalibrators[:, 0, 0] = gX * np.cos(leakage)
+            uncalibrators[:, 0, 1] = gX * np.sin(leakage)
+            uncalibrators[:, 1, 0] = -gY * np.sin(leakage)
+            uncalibrators[:, 1, 1] = gY * np.cos(leakage)
 
-    mset.close()
+            # Uncalibrate data
+            uncalibrators_H = np.conj(np.transpose(uncalibrators, [0, 2, 1]))
+            for i in range(0, data.shape[1]):
+                data[:, i, :] = np.reshape(
+                    np.matmul(
+                        uncalibrators[ant1],
+                        np.matmul(
+                            np.reshape(data[:, i, :], (len(ant1), 2, 2)), uncalibrators_H[ant2]
+                        )
+                    ),
+                    (len(ant1), 4)
+                )
 
-mset = MeasurementSet('modelled.ms', refant=8, datacolumn='DATA')
-data = mset.data
-ant1, ant2 = mset.ant1, mset.ant2
+        if args.noise:
+            # Add noise
+            data += np.random.normal(0, args.noise, data.shape) + 1j * np.random.normal(0, args.noise, data.shape)
 
-# Leakage
-leakage =  np.random.uniform(-np.pi, np.pi, len(mset.antids))
-
-# Gains
-gX = np.random.uniform(0.1, 3, len(mset.antids)) * np.exp(1j * np.random.uniform(-np.pi, np.pi, len(mset.antids)))
-gY = np.random.uniform(0.1, 3, len(mset.antids)) * np.exp(1j * np.random.uniform(-np.pi, np.pi, len(mset.antids)))
-
-# Uncalibration array
-uncalibrators = np.zeros((len(mset.antids), 2, 2), dtype=np.complex)
-uncalibrators[:, 0, 0] = gX * np.cos(leakage)
-uncalibrators[:, 0, 1] = gX * np.sin(leakage)
-uncalibrators[:, 1, 0] = -gY * np.sin(leakage)
-uncalibrators[:, 1, 1] = gY * np.cos(leakage)
-
-# Uncalibrate data
-uncalibrators_H = np.conj(np.transpose(uncalibrators, [0, 2, 1]))
-for i, freqs in enumerate(mset.freqs):
-    data[:, i, :] = np.reshape(
-        np.matmul(
-            uncalibrators[ant1],
-            np.matmul(
-                np.reshape(data[:, i, :], (len(ant1), 2, 2)), uncalibrators_H[ant2]
-            )
-        ),
-        (len(ant1), 4)
-    )
-
-# Add noise
-data += np.random.normal(0, 45, data.shape)
-
-mset.filtered.putcol('CORRECTED_DATA', data)
-mset.close()
+        mset.putcol('CORRECTED_DATA', data)
+        mset.close()
 
 
-# Todo
-#
-# * add bandpass
-# * add directional polarisation leakage factor
-
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--mset', required=True)
+    parser.add_argument('--model', required=True)
+    parser.add_argument('--metafits', required=True)
+    parser.add_argument('--nosimulate', action='store_true')
+    parser.add_argument('--uncalibrate', action='store_true')
+    parser.add_argument('--noise', type=float, default=0)
+    args = parser.parse_args()
+    main(args)
 
