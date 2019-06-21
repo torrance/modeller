@@ -49,7 +49,7 @@ def main(args):
         for start in range(0, len(comps), batch):
             end = start + batch
             print("Processing sources %d - %d" % (start, start + len(fluxes[start:end])))
-            predict(mset, mwabeam, ras[start:end], decs[start:end], fluxes[start:end])
+            predict(mset, mwabeam, ras[start:end], decs[start:end], fluxes[start:end], applybeam=False)
 
         mset.close()
 

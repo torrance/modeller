@@ -61,13 +61,11 @@ def predict(mset, mwabeam, ras, decs, fluxes, applybeam=True):
         start = tm.time()
         tpb = (25, 25)
         bpg = (data.shape[0] // 25 + 1, data.shape[1] // 25 + 1)
-        threadlock = threading.Lock()
 
-        def _thread(ngpu, start, end):
-            _data = data.copy()
+        def _thread(data, ngpu, start, end):
             with cuda.gpus[ngpu]:
                 cudapredict[bpg, tpb](
-                    _data,
+                    data,
                     u_lambda,
                     v_lambda,
                     w_lambda,
@@ -77,17 +75,16 @@ def predict(mset, mwabeam, ras, decs, fluxes, applybeam=True):
                     ns[start:end],
                 )
 
-            with threadlock:
-                data.__iadd__(_data)  # Usual '+=' triggers a python error
-
         # Send to multiple GPUs if present
         ngpus = len(cuda.gpus)
         batch = len(fluxes) // ngpus + 1
         threads = []
+        datas = []
         for i in range(0, ngpus):
             print("Starting work on gpu %d..." % i)
+            datas.append(data.copy())
             thread = threading.Thread(target=_thread, args=(
-                i, batch * i, batch * (i + 1)
+                datas[i], i, batch * i, batch * (i + 1)
             ))
             threads.append(thread)
             thread.start()
@@ -100,7 +97,7 @@ def predict(mset, mwabeam, ras, decs, fluxes, applybeam=True):
             print("Done")
 
         print("Prediction elapsed: %g" % (tm.time() - start))
-        tbl.putcol('DATA', data)
+        tbl.putcol('DATA', np.sum(datas, axis=0))
 
 
 @njit([
