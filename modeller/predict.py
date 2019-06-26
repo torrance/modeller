@@ -24,7 +24,7 @@ def predict(mset, mwabeam, ras, decs, fluxes, applybeam=True):
     ls, ms, ns = float32(ls), float32(ms), float32(ns)
 
     for i, unique_time in enumerate(unique_times):
-        # print("Time interval: %d/%d" % (i+1, len(unique_times)))
+        print("Time interval: %d/%d" % (i+1, len(unique_times)))
         tbl = taql("select UVW, DATA from $mset where TIME = $unique_time and not FLAG_ROW and ANTENNA1 <> ANTENNA2")
         uvw, data = tbl.getcol('UVW'), tbl.getcol('DATA')
 
@@ -76,28 +76,31 @@ def predict(mset, mwabeam, ras, decs, fluxes, applybeam=True):
                 )
 
         # Send to multiple GPUs if present
-        ngpus = len(cuda.gpus)
-        batch = len(fluxes) // ngpus + 1
-        threads = []
-        datas = []
-        for i in range(0, ngpus):
-            print("Starting work on gpu %d..." % i)
-            datas.append(data.copy())
-            thread = threading.Thread(target=_thread, args=(
-                datas[i], i, batch * i, batch * (i + 1)
-            ))
-            threads.append(thread)
-            thread.start()
-            print("Started")
+        # ngpus = len(cuda.gpus)
+        # batch = len(fluxes) // ngpus + 1
+        # threads = []
+        # datas = []
+        # for i in range(0, ngpus):
+        #     print("Starting work on gpu %d..." % i)
+        #     datas.append(data.copy())
+        #     thread = threading.Thread(target=_thread, args=(
+        #         datas[i], i, batch * i, batch * (i + 1)
+        #     ))
+        #     threads.append(thread)
+        #     thread.start()
+        #     print("Started")
 
-        # Wait for all GPUs to complete
-        for thread in threads:
-            print("Waiting for device %d to finish..." % i)
-            thread.join()
-            print("Done")
+        # # Wait for all GPUs to complete
+        # for i, thread in enumerate(threads):
+        #     print("Waiting for device %d to finish..." % i)
+        #     thread.join()
+        #     print("Done")
+        # cpupredict(data, u_lambda, v_lambda, w_lambda, I_app, ls, ms, ns)
+        cudapredict[bpg, tpb](data, u_lambda, v_lambda, w_lambda, I_app, ls, ms, ns)
 
         print("Prediction elapsed: %g" % (tm.time() - start))
-        tbl.putcol('DATA', np.sum(datas, axis=0))
+        tbl.putcol('DATA', data)
+        tbl.flush()
 
 
 @njit([
@@ -106,13 +109,12 @@ def predict(mset, mwabeam, ras, decs, fluxes, applybeam=True):
 def cpupredict(data, u_lambda, v_lambda, w_lambda, I_app, ls, ms, ns):
     # Parallelize over points
     for i in prange(0, len(I_app)):
-        point = np.exp(2j * np.pi * (
-            u_lambda * ls[i] + v_lambda * ms[i] + w_lambda * (ns[i] -1)
-        ))
-
         for j in range(0, u_lambda.shape[0]):
             for k in range(0, u_lambda.shape[1]):
-                data[j, k] += I_app[i, k, :] *  point[j, k]
+                point = np.exp(2j * np.pi * (
+                    u_lambda[j, k] * ls[i] + v_lambda[j, k] * ms[i] + w_lambda[j, k] * (ns[i] -1)
+                ))
+                data[j, k] += I_app[i, k, :] * point
 
 
 @cuda.jit(

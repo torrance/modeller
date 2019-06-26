@@ -38,6 +38,7 @@ def main(args):
         data = mset.getcol('DATA')
         data[:] = 0
         mset.putcol('DATA', data)
+        mset.flush()
 
         # Calculate fluxes for each source for each frequency
         fluxes = np.empty((len(comps), len(freqs)))
@@ -45,7 +46,7 @@ def main(args):
             fluxes[i] = comp.flux(freqs)
 
         # Batch sources
-        batch = 100000
+        batch = 200000
         for start in range(0, len(comps), batch):
             end = start + batch
             print("Processing sources %d - %d" % (start, start + len(fluxes[start:end])))
