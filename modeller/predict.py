@@ -5,6 +5,7 @@ import time as tm
 import threading
 
 from astropy.time import Time
+import astropy.units as units
 from casacore.tables import taql
 from numba import njit, cuda, float32, complex64, void, prange
 import numpy as np
@@ -44,11 +45,10 @@ def predict(mset, mwabeam, ras, decs, fluxes, applybeam=True):
 
         if applybeam:
             chunksize = 64
-            for i in range(0, len(freqs), chunksize):
-                ch_start = i
-                ch_end = i + chunksize
-                midfreq = np.mean(freqs[ch_start:ch_end])
-                jones[:, ch_start:ch_end, :, :] = mwabeam.jones(ras, decs, midfreq)[:, None, :, :]
+            assert(len(freqs) % chunksize == 0)
+            midfreqs = np.mean(np.reshape(freqs, (-1, 64)), axis=1)
+            idx = np.repeat(range(len(freqs) // chunksize), chunksize)
+            jones = mwabeam.jones(ras, decs, midfreqs)[:, idx]
             jones_H = np.conj(np.transpose(jones, axes=[0, 1, 3, 2]))
             I_app = np.matmul(jones, np.matmul(I, jones_H))
             I_app = np.reshape(I_app, (len(fluxes), len(freqs), 4))
