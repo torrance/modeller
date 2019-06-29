@@ -24,15 +24,17 @@ def main(args):
         freqs = mset.SPECTRAL_WINDOW.getcell('CHAN_FREQ', 0)
         midfreq = np.mean(freqs)
 
-        with open(args.model) as f:
-            models = np.array(skymodel.parse(f))
-
-        comps = np.array([comp for model in models for comp in model.components if comp.flux(midfreq) > args.fluxthreshold])
-        ras = np.array([comp.ra for comp in comps])
-        decs = np.array([comp.dec for comp in comps])
+        # Extract the catalogue
+        models = np.load(args.model)
+        ras = models[:, 0]
+        decs = models[:, 1]
+        fluxes = (
+                models[:, 3][:, None] *
+                (freqs[None, :] / models[:, 2][:, None])**models[:, 4][:, None]
+        )
 
         mwabeam = MWABeam(args.metafits)
-        print("Simulating %d components" % len(comps))
+        print("Simulating %d components" % len(models))
 
         # Reset data
         data = mset.getcol('DATA')
@@ -40,17 +42,12 @@ def main(args):
         mset.putcol('DATA', data)
         mset.flush()
 
-        # Calculate fluxes for each source for each frequency
-        fluxes = np.empty((len(comps), len(freqs)))
-        for i, comp in enumerate(comps):
-            fluxes[i] = comp.flux(freqs)
-
         # Batch sources
         batch = 200000
-        for start in range(0, len(comps), batch):
+        for start in range(0, len(models), batch):
             end = start + batch
             print("Processing sources %d - %d" % (start, start + len(fluxes[start:end])))
-            predict(mset, mwabeam, ras[start:end], decs[start:end], fluxes[start:end], applybeam=False)
+            predict(mset, mwabeam, ras[start:end], decs[start:end], fluxes[start:end], applybeam=True)
 
         mset.close()
 
