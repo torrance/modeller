@@ -1,6 +1,8 @@
 from __future__ import division, print_function
 
 import math
+from multiprocessing.dummy import Pool
+import sys
 import time as tm
 import threading
 
@@ -24,17 +26,22 @@ def predict(mset, mwabeam, ras, decs, fluxes, applybeam=True):
     ns = np.sqrt(1 - ls**2 - ms**2)
     ls, ms, ns = float32(ls), float32(ms), float32(ns)
 
-    for i, unique_time in enumerate(unique_times):
-        print("Time interval: %d/%d" % (i+1, len(unique_times)))
-        tbl = taql("select UVW, DATA from $mset where TIME = $unique_time and not FLAG_ROW and ANTENNA1 <> ANTENNA2")
-        uvw, data = tbl.getcol('UVW'), tbl.getcol('DATA')
+    # Set up multithreading across multiple GPUs
+    ngpus = len(cuda.gpus)
+    msetlock, beamlock = threading.Lock(), threading.Lock()
+    pool = Pool(ngpus)
+
+    def _predict_timeinterval(i, mset, unique_time):
+        print("Time interval: %d/%d" % (i+1, len(unique_times))); sys.stdout.flush()
+        with msetlock:
+            tbl = taql("select UVW, DATA from $mset where TIME = $unique_time and not FLAG_ROW and ANTENNA1 <> ANTENNA2")
+            uvw, data = tbl.getcol('UVW'), tbl.getcol('DATA')
 
         u_lambda, v_lambda, w_lambda = np.float32(uvw.T[:, :, None] / lambdas)
         u_lambda, v_lambda, w_lambda = u_lambda.copy(), v_lambda.copy(), w_lambda.copy()
 
         julian_date = unique_time // (24*60*60) + (unique_time % (24*60*60) / (24*60*60))
         julian_date = Time(julian_date, format='mjd')
-        mwabeam.time = julian_date
 
         # Prepare I_app
         start = tm.time()
@@ -44,63 +51,50 @@ def predict(mset, mwabeam, ras, decs, fluxes, applybeam=True):
         I[:, :, 1, 1] = fluxes  # YY
 
         if applybeam:
-            chunksize = 64
-            assert(len(freqs) % chunksize == 0)
-            midfreqs = np.mean(np.reshape(freqs, (-1, 64)), axis=1)
-            idx = np.repeat(range(len(freqs) // chunksize), chunksize)
-            jones = mwabeam.jones(ras, decs, midfreqs)[:, idx]
+            # We create a threadlock to calculate mwabeam, as we don't know
+            # how threadsafe mwa_pb is
+            with beamlock:
+                mwabeam.time = julian_date
+                chunksize = 64
+                assert(len(freqs) % chunksize == 0)
+                midfreqs = np.mean(np.reshape(freqs, (-1, 64)), axis=1)
+                idx = np.repeat(range(len(freqs) // chunksize), chunksize)
+                jones = mwabeam.jones(ras, decs, midfreqs)[:, idx]
             jones_H = np.conj(np.transpose(jones, axes=[0, 1, 3, 2]))
             I_app = np.matmul(jones, np.matmul(I, jones_H))
             I_app = np.reshape(I_app, (len(fluxes), len(freqs), 4))
             I_app = np.complex64(I_app)
         else:
             I_app = np.complex64(np.reshape(I, (len(fluxes), len(freqs), 4)))
-        print("Beam calculation elapsed: %g" % (tm.time() - start))
+        print("(%d/%d) Beam calculation elapsed: %g" % (i, len(unique_times), tm.time() - start)); sys.stdout.flush()
 
         # Predict
         start = tm.time()
         tpb = (25, 25)
         bpg = (data.shape[0] // 25 + 1, data.shape[1] // 25 + 1)
+        ngpu = i % ngpus
+        with cuda.gpus[ngpu]:
+            cudapredict[bpg, tpb](
+                data,
+                u_lambda,
+                v_lambda,
+                w_lambda,
+                I_app,
+                ls,
+                ms,
+                ns
+            )
+        print("(%d/%d) Prediction elapsed: %g" % (i, len(unique_times), tm.time() - start)); sys.stdout.flush()
 
-        def _thread(data, ngpu, start, end):
-            with cuda.gpus[ngpu]:
-                cudapredict[bpg, tpb](
-                    data,
-                    u_lambda,
-                    v_lambda,
-                    w_lambda,
-                    I_app[start:end],
-                    ls[start:end],
-                    ms[start:end],
-                    ns[start:end],
-                )
+        with msetlock:
+            tbl.putcol('DATA', data)
+            tbl.flush()
 
-        # Send to multiple GPUs if present
-        # ngpus = len(cuda.gpus)
-        # batch = len(fluxes) // ngpus + 1
-        # threads = []
-        # datas = []
-        # for i in range(0, ngpus):
-        #     print("Starting work on gpu %d..." % i)
-        #     datas.append(data.copy())
-        #     thread = threading.Thread(target=_thread, args=(
-        #         datas[i], i, batch * i, batch * (i + 1)
-        #     ))
-        #     threads.append(thread)
-        #     thread.start()
-        #     print("Started")
-
-        # # Wait for all GPUs to complete
-        # for i, thread in enumerate(threads):
-        #     print("Waiting for device %d to finish..." % i)
-        #     thread.join()
-        #     print("Done")
-        # cpupredict(data, u_lambda, v_lambda, w_lambda, I_app, ls, ms, ns)
-        cudapredict[bpg, tpb](data, u_lambda, v_lambda, w_lambda, I_app, ls, ms, ns)
-
-        print("Prediction elapsed: %g" % (tm.time() - start))
-        tbl.putcol('DATA', data)
-        tbl.flush()
+    # Enqueue the threads
+    for i, unique_time in enumerate(unique_times):
+        pool.apply_async(_predict_timeinterval, (i, mset, unique_time))
+    pool.close()
+    pool.join()
 
 
 @njit([

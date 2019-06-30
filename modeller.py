@@ -2,6 +2,7 @@
 from __future__ import print_function, division
 
 import argparse
+import sys
 import time as tm
 
 from astropy.coordinates import SkyCoord
@@ -34,7 +35,7 @@ def main(args):
         )
 
         mwabeam = MWABeam(args.metafits)
-        print("Simulating %d components" % len(models))
+        print("Simulating %d components" % len(models)); sys.stdout.flush()
 
         # Reset data
         data = mset.getcol('DATA')
@@ -46,7 +47,7 @@ def main(args):
         batch = 200000
         for start in range(0, len(models), batch):
             end = start + batch
-            print("Processing sources %d - %d" % (start, start + len(fluxes[start:end])))
+            print("Processing sources %d - %d" % (start, start + len(fluxes[start:end]))); sys.stdout.flush()
             predict(mset, mwabeam, ras[start:end], decs[start:end], fluxes[start:end], applybeam=True)
 
         mset.close()
