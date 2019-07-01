@@ -13,6 +13,7 @@ from numba import njit, cuda, float32, complex64, void, prange
 import numpy as np
 
 from astrobits.coordinates import radec_to_lm
+from astrobits.mwabeam import minimalmap
 
 
 def predict(mset, mwabeam, ras, decs, fluxes, applybeam=True):
@@ -25,6 +26,12 @@ def predict(mset, mwabeam, ras, decs, fluxes, applybeam=True):
     ls, ms = radec_to_lm(ras, decs, ra0, dec0)
     ns = np.sqrt(1 - ls**2 - ms**2)
     ls, ms, ns = float32(ls), float32(ms), float32(ns)
+
+    # Reduce simulation points to minimal set needed to sample beam
+    start = tm.time()
+    seeds, inverse = minimalmap(ras, decs, 180*units.arcsecond)
+    seed_ras, seed_decs = ras[seeds], decs[seeds]
+    print("Minimalmap reduction (%d -> %d) elapsed: %g" % (len(ras), len(seeds), tm.time() - start)); sys.stdout.flush()
 
     # Set up multithreading across multiple GPUs
     ngpus = len(cuda.gpus)
@@ -57,9 +64,11 @@ def predict(mset, mwabeam, ras, decs, fluxes, applybeam=True):
                 mwabeam.time = julian_date
                 chunksize = 64
                 assert(len(freqs) % chunksize == 0)
-                midfreqs = np.mean(np.reshape(freqs, (-1, 64)), axis=1)
-                idx = np.repeat(range(len(freqs) // chunksize), chunksize)
-                jones = mwabeam.jones(ras, decs, midfreqs)[:, idx]
+                for j in range(0, len(freqs), chunksize):
+                    ch_start = j
+                    ch_end = j + chunksize
+                    midfreq = np.mean(freqs[ch_start:ch_end])
+                    jones[:, ch_start:ch_end, :, :] = mwabeam.jones(seed_ras, seed_decs, midfreq)[inverse, None, :, :]
             jones_H = np.conj(np.transpose(jones, axes=[0, 1, 3, 2]))
             I_app = np.matmul(jones, np.matmul(I, jones_H))
             I_app = np.reshape(I_app, (len(fluxes), len(freqs), 4))

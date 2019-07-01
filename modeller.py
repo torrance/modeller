@@ -29,10 +29,6 @@ def main(args):
         models = np.load(args.model)
         ras = models[:, 0]
         decs = models[:, 1]
-        fluxes = (
-                models[:, 3][:, None] *
-                (freqs[None, :] / models[:, 2][:, None])**models[:, 4][:, None]
-        )
 
         mwabeam = MWABeam(args.metafits)
         print("Simulating %d components" % len(models)); sys.stdout.flush()
@@ -44,10 +40,13 @@ def main(args):
         mset.flush()
 
         # Batch sources
-        batch = 200000
-        for start in range(0, len(models), batch):
-            end = start + batch
-            print("Processing sources %d - %d" % (start, start + len(fluxes[start:end]))); sys.stdout.flush()
+        for start in range(0, len(models), args.batchsize):
+            end = start + args.batchsize
+            print("Processing sources %d - %d" % (start, start + len(models[start:end]))); sys.stdout.flush()
+            fluxes = (
+                    models[start:end, 3][:, None] *
+                    (freqs[None, :] / models[start:end, 2][:, None])**models[start:end, 4][:, None]
+            )
             predict(mset, mwabeam, ras[start:end], decs[start:end], fluxes[start:end], applybeam=True)
 
         mset.close()
@@ -105,6 +104,7 @@ if __name__ == '__main__':
     parser.add_argument('--uncalibrate', action='store_true')
     parser.add_argument('--fluxthreshold', type=float, default=0)
     parser.add_argument('--noise', type=float, default=0)
+    parser.add_argument('--batchsize', type=int, default=200000)
     args = parser.parse_args()
     main(args)
 
