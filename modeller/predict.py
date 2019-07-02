@@ -1,10 +1,12 @@
 from __future__ import division, print_function
 
+from functools import wraps
 import math
 from multiprocessing.dummy import Pool
 import sys
 import time as tm
 import threading
+import traceback
 
 from astropy.time import Time
 import astropy.units as units
@@ -31,6 +33,7 @@ def predict(mset, mwabeam, ras, decs, fluxes, applybeam=True):
     msetlock  = threading.Lock()
     pool = Pool(ngpus)
 
+    @print_exception
     def _predict_timeinterval(i, mset, unique_time):
         print("Time interval: %d/%d" % (i, len(unique_times))); sys.stdout.flush()
         t0 = tm.time()
@@ -163,3 +166,14 @@ def matmul(a, b, c):
                             x[n, m, i, j] += a[n, m, i, k] * b[n, m, k, l] * c[n, m, l, j]
 
     return x
+
+
+def print_exception(func):
+    @wraps(func)
+    def decorator(*args, **kwargs):
+        try:
+            func(*args, **kwargs)
+        except:
+            print(traceback.format_exc())
+            sys.stdout.flush()
+    return decorator
