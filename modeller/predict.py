@@ -13,7 +13,6 @@ from numba import njit, cuda, float32, complex64, void, prange
 import numpy as np
 
 from astrobits.coordinates import radec_to_lm
-from astrobits.mwabeam import minimalmap
 
 
 def predict(mset, mwabeam, ras, decs, fluxes, applybeam=True):
@@ -27,22 +26,18 @@ def predict(mset, mwabeam, ras, decs, fluxes, applybeam=True):
     ns = np.sqrt(1 - ls**2 - ms**2)
     ls, ms, ns = float32(ls), float32(ms), float32(ns)
 
-    # Reduce simulation points to minimal set needed to sample beam
-    start = tm.time()
-    seeds, inverse = minimalmap(ras, decs, 180*units.arcsecond)
-    seed_ras, seed_decs = ras[seeds], decs[seeds]
-    print("Minimalmap reduction (%d -> %d) elapsed: %g" % (len(ras), len(seeds), tm.time() - start)); sys.stdout.flush()
-
     # Set up multithreading across multiple GPUs
     ngpus = len(cuda.gpus)
-    msetlock, beamlock = threading.Lock(), threading.Lock()
+    msetlock  = threading.Lock()
     pool = Pool(ngpus)
 
     def _predict_timeinterval(i, mset, unique_time):
-        print("Time interval: %d/%d" % (i+1, len(unique_times))); sys.stdout.flush()
+        print("Time interval: %d/%d" % (i, len(unique_times))); sys.stdout.flush()
+        t0 = tm.time()
         with msetlock:
             tbl = taql("select UVW, DATA from $mset where TIME = $unique_time and not FLAG_ROW and ANTENNA1 <> ANTENNA2")
             uvw, data = tbl.getcol('UVW'), tbl.getcol('DATA')
+        print("(%d/%d) Loading mset elapsed %g" % (i, len(unique_times), tm.time() - t0));
 
         u_lambda, v_lambda, w_lambda = np.float32(uvw.T[:, :, None] / lambdas)
         u_lambda, v_lambda, w_lambda = u_lambda.copy(), v_lambda.copy(), w_lambda.copy()
@@ -58,17 +53,13 @@ def predict(mset, mwabeam, ras, decs, fluxes, applybeam=True):
         I[:, :, 1, 1] = fluxes  # YY
 
         if applybeam:
-            # We create a threadlock to calculate mwabeam, as we don't know
-            # how threadsafe mwa_pb is
-            with beamlock:
-                mwabeam.time = julian_date
-                chunksize = 64
-                assert(len(freqs) % chunksize == 0)
-                for j in range(0, len(freqs), chunksize):
-                    ch_start = j
-                    ch_end = j + chunksize
-                    midfreq = np.mean(freqs[ch_start:ch_end])
-                    jones[:, ch_start:ch_end, :, :] = mwabeam.jones(seed_ras, seed_decs, midfreq)[inverse, None, :, :]
+            chunksize = 64
+            assert(len(freqs) % chunksize == 0)
+            midfreqs = np.mean(np.reshape(freqs, (-1, 64)), axis=1)
+            j = mwabeam.joness(ras, decs, midfreqs, time=julian_date)
+            for ch_start in range(0, len(freqs), chunksize):
+                ch_end = ch_start + chunksize
+                jones[:, ch_start:ch_end, :, :] = j[:, [ch_start // chunksize], :, :]
             jones_H = np.conj(np.transpose(jones, axes=[0, 1, 3, 2]))
             I_app = np.matmul(jones, np.matmul(I, jones_H))
             I_app = np.reshape(I_app, (len(fluxes), len(freqs), 4))
@@ -102,6 +93,7 @@ def predict(mset, mwabeam, ras, decs, fluxes, applybeam=True):
     # Enqueue the threads
     for i, unique_time in enumerate(unique_times):
         pool.apply_async(_predict_timeinterval, (i, mset, unique_time))
+        #_predict_timeinterval(i, mset, unique_time)
     pool.close()
     pool.join()
 
