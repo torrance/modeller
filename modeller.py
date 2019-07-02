@@ -48,7 +48,7 @@ def main(args):
                     models[start:end, 3][:, None] *
                     (freqs[None, :] / models[start:end, 2][:, None])**models[start:end, 4][:, None]
             )
-            predict(mset, mwabeam, ras[start:end], decs[start:end], fluxes[start:end], applybeam=True)
+            predict(mset, mwabeam, ras[start:end], decs[start:end], fluxes, applybeam=True)
             print("Source batch simulated elapsed %g" % (tm.time() - t0)); sys.stdout.flush()
 
         mset.close()
