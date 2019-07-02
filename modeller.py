@@ -41,6 +41,7 @@ def main(args):
 
         # Batch sources
         for start in range(0, len(models), args.batchsize):
+            t0 = tm.time()
             end = start + args.batchsize
             print("Processing sources %d - %d" % (start, start + len(models[start:end]))); sys.stdout.flush()
             fluxes = (
@@ -48,6 +49,7 @@ def main(args):
                     (freqs[None, :] / models[start:end, 2][:, None])**models[start:end, 4][:, None]
             )
             predict(mset, mwabeam, ras[start:end], decs[start:end], fluxes[start:end], applybeam=True)
+            print("Source batch simulated elapsed %g" % (tm.time() - t0)); sys.stdout.flush()
 
         mset.close()
 
