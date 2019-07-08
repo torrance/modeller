@@ -51,7 +51,7 @@ def main(args):
     # s(nu) = A * nu^alpha
     # => A = s / nu^alpha
 
-    batch = 1000
+    batch = 200000
     for start in range(0, len(model), batch):
         end = start + batch
         print("Predicting %d-%d / %d model components" % (start, start + len(model[start:end]), len(model)))
