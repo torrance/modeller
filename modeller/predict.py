@@ -1,10 +1,12 @@
 from __future__ import division, print_function
 
+from functools import wraps
 import math
 from multiprocessing.dummy import Pool
 import sys
 import time as tm
 import threading
+import traceback
 
 from astropy.time import Time
 import astropy.units as units
@@ -31,13 +33,14 @@ def predict(mset, mwabeam, ras, decs, fluxes, applybeam=True):
     msetlock  = threading.Lock()
     pool = Pool(ngpus)
 
+    @print_exception
     def _predict_timeinterval(i, mset, unique_time):
         print("Time interval: %d/%d" % (i, len(unique_times))); sys.stdout.flush()
         t0 = tm.time()
         with msetlock:
             tbl = taql("select UVW, DATA from $mset where TIME = $unique_time and not FLAG_ROW and ANTENNA1 <> ANTENNA2")
             uvw, data = tbl.getcol('UVW'), tbl.getcol('DATA')
-        print("(%d/%d) Loading mset elapsed %g" % (i, len(unique_times), tm.time() - t0));
+        print("(%d/%d) Loading mset elapsed %g" % (i, len(unique_times), tm.time() - t0)); sys.stdout.flush()
 
         u_lambda, v_lambda, w_lambda = np.float32(uvw.T[:, :, None] / lambdas)
         u_lambda, v_lambda, w_lambda = u_lambda.copy(), v_lambda.copy(), w_lambda.copy()
@@ -46,7 +49,7 @@ def predict(mset, mwabeam, ras, decs, fluxes, applybeam=True):
         julian_date = Time(julian_date, format='mjd')
 
         # Prepare I_app
-        start = tm.time()
+        t0 = tm.time()
         I = np.zeros((len(fluxes), len(freqs), 2, 2))
         jones = np.zeros((len(fluxes), len(freqs), 2, 2), dtype=np.complex128)
         I[:, :, 0, 0] = fluxes  # XX
@@ -56,20 +59,23 @@ def predict(mset, mwabeam, ras, decs, fluxes, applybeam=True):
             chunksize = 64
             assert(len(freqs) % chunksize == 0)
             midfreqs = np.mean(np.reshape(freqs, (-1, 64)), axis=1)
+
             j = mwabeam.joness(ras, decs, midfreqs, time=julian_date)
             for ch_start in range(0, len(freqs), chunksize):
                 ch_end = ch_start + chunksize
                 jones[:, ch_start:ch_end, :, :] = j[:, [ch_start // chunksize], :, :]
+
             jones_H = np.conj(np.transpose(jones, axes=[0, 1, 3, 2]))
-            I_app = np.matmul(jones, np.matmul(I, jones_H))
+            I_app = matmul(jones, I, jones_H)
             I_app = np.reshape(I_app, (len(fluxes), len(freqs), 4))
             I_app = np.complex64(I_app)
         else:
             I_app = np.complex64(np.reshape(I, (len(fluxes), len(freqs), 4)))
-        print("(%d/%d) Beam calculation elapsed: %g" % (i, len(unique_times), tm.time() - start)); sys.stdout.flush()
+
+        print("(%d/%d) Beam calculation elapsed: %g" % (i, len(unique_times), tm.time() - t0)); sys.stdout.flush()
 
         # Predict
-        start = tm.time()
+        t0 = tm.time()
         tpb = (25, 25)
         bpg = (data.shape[0] // 25 + 1, data.shape[1] // 25 + 1)
         ngpu = i % ngpus
@@ -84,16 +90,18 @@ def predict(mset, mwabeam, ras, decs, fluxes, applybeam=True):
                 ms,
                 ns
             )
-        print("(%d/%d) Prediction elapsed: %g" % (i, len(unique_times), tm.time() - start)); sys.stdout.flush()
+        print("(%d/%d) Prediction elapsed: %g" % (i, len(unique_times), tm.time() - t0)); sys.stdout.flush()
 
+        t0 = tm.time()
         with msetlock:
             tbl.putcol('DATA', data)
             tbl.flush()
+        print("(%d/%d) Writing data elapsed: %g" % (i, len(unique_times), tm.time() - t0)); sys.stdout.flush()
 
     # Enqueue the threads
     for i, unique_time in enumerate(unique_times):
         pool.apply_async(_predict_timeinterval, (i, mset, unique_time))
-        #_predict_timeinterval(i, mset, unique_time)
+        # _predict_timeinterval(i, mset, unique_time)
     pool.close()
     pool.join()
 
@@ -139,3 +147,33 @@ def cudapredict(data, u_lambda, v_lambda, w_lambda, I_app, ls, ms, ns):
 
     for pol in range(0, 4):
         data[nrow, nchan, pol] += tmp[pol]
+
+
+@njit(parallel=True)
+def matmul(a, b, c):
+    """
+    Our own custom version of matmul is ~10 times faster than numpy's matmul
+    """
+    x = np.zeros_like(a)
+    for n in prange(a.shape[0]):
+        for m in range(a.shape[1]):
+            # Einstein Notation
+            # x_ij = a_ik * b_kl * c_lj
+            for i in [0, 1]:
+                for j in [0, 1]:
+                    for k in [0, 1]:
+                        for l in [0, 1]:
+                            x[n, m, i, j] += a[n, m, i, k] * b[n, m, k, l] * c[n, m, l, j]
+
+    return x
+
+
+def print_exception(func):
+    @wraps(func)
+    def decorator(*args, **kwargs):
+        try:
+            func(*args, **kwargs)
+        except:
+            print(traceback.format_exc())
+            sys.stdout.flush()
+    return decorator
